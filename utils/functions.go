@@ -3,10 +3,13 @@ package utils
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -17,23 +20,29 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 
-	"github.com/snail007/goproxy/services/kcpcfg"
+	"github.com/snail007/goproxy/core/lib/kcpcfg"
+	"github.com/snail007/goproxy/utils/lb"
 
 	"golang.org/x/crypto/pbkdf2"
 
 	"strconv"
-	"strings"
+
 	"time"
-	"context"
 
 	"github.com/snail007/goproxy/utils/id"
 
 	kcp "github.com/xtaci/kcp-go"
-	
 )
 
 func IoBind(dst io.ReadWriteCloser, src io.ReadWriteCloser, fn func(err interface{}), log *logger.Logger) {
+	ioBind(dst, src, fn, log, true)
+}
+func IoBindNoClose(dst io.ReadWriteCloser, src io.ReadWriteCloser, fn func(err interface{}), log *logger.Logger) {
+	ioBind(dst, src, fn, log, false)
+}
+func ioBind(dst io.ReadWriteCloser, src io.ReadWriteCloser, fn func(err interface{}), log *logger.Logger, close bool) {
 	go func() {
 		defer func() {
 			if err := recover(); err != nil {
@@ -69,20 +78,41 @@ func IoBind(dst io.ReadWriteCloser, src io.ReadWriteCloser, fn func(err interfac
 		case err = <-e2:
 			//log.Printf("e2")
 		}
-		src.Close()
-		dst.Close()
+		func() {
+			defer func() {
+				_ = recover()
+			}()
+			if close {
+				src.Close()
+			}
+		}()
+		func() {
+			defer func() {
+				_ = recover()
+			}()
+			if close {
+				dst.Close()
+			}
+		}()
 		if fn != nil {
 			fn(err)
 		}
 	}()
 }
 func ioCopy(dst io.ReadWriter, src io.ReadWriter) (err error) {
+	defer func() {
+		if e := recover(); e != nil {
+		}
+	}()
 	buf := LeakyBuffer.Get()
 	defer LeakyBuffer.Put(buf)
 	n := 0
 	for {
 		n, err = src.Read(buf)
 		if n > 0 {
+			if n > len(buf) {
+				n = len(buf)
+			}
 			if _, e := dst.Write(buf[0:n]); e != nil {
 				return e
 			}
@@ -109,6 +139,9 @@ func TlsConnect(host string, port, timeout int, certBytes, keyBytes, caCertBytes
 	}
 	return *tls.Client(_conn, conf), err
 }
+func TlsConfig(certBytes, keyBytes, caCertBytes []byte) (conf *tls.Config, err error) {
+	return getRequestTlsConfig(certBytes, keyBytes, caCertBytes)
+}
 func getRequestTlsConfig(certBytes, keyBytes, caCertBytes []byte) (conf *tls.Config, err error) {
 
 	var cert tls.Certificate
@@ -120,6 +153,7 @@ func getRequestTlsConfig(certBytes, keyBytes, caCertBytes []byte) (conf *tls.Con
 	caBytes := certBytes
 	if caCertBytes != nil {
 		caBytes = caCertBytes
+
 	}
 	ok := serverCertPool.AppendCertsFromPEM(caBytes)
 	if !ok {
@@ -210,8 +244,13 @@ func CloseConn(conn *net.Conn) {
 		(*conn).Close()
 	}
 }
-func GetAllInterfaceAddr() ([]net.IP, error) {
 
+var allInterfaceAddrCache []net.IP
+
+func GetAllInterfaceAddr() ([]net.IP, error) {
+	if allInterfaceAddrCache != nil {
+		return allInterfaceAddrCache, nil
+	}
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
@@ -252,6 +291,7 @@ func GetAllInterfaceAddr() ([]net.IP, error) {
 		return nil, fmt.Errorf("no address Found, net.InterfaceAddrs: %v", addresses)
 	}
 	//only need first
+	allInterfaceAddrCache = addresses
 	return addresses, nil
 }
 func UDPPacket(srcAddr string, packet []byte) []byte {
@@ -302,10 +342,10 @@ func ReadUDPPacket(_reader io.Reader) (srcAddr string, packet []byte, err error)
 	return
 }
 func Uniqueid() string {
-	return xid.New().String()
-	// var src = rand.NewSource(time.Now().UnixNano())
-	// s := fmt.Sprintf("%d", src.Int63())
-	// return s[len(s)-5:len(s)-1] + fmt.Sprintf("%d", uint64(time.Now().UnixNano()))[8:]
+	str := fmt.Sprintf("%d%s", time.Now().UnixNano(), xid.New().String())
+	hash := sha1.New()
+	hash.Write([]byte(str))
+	return hex.EncodeToString(hash.Sum(nil))
 }
 func RandString(strlen int) string {
 	codes := "QWERTYUIOPLKJHGFDSAZXCVBNMabcdefghijklmnopqrstuvwxyz0123456789"
@@ -330,15 +370,24 @@ func RandInt(strLen int) int64 {
 	i, _ := strconv.ParseInt(string(data), 10, 64)
 	return i
 }
-func ReadData(r io.Reader) (data string, err error) {
-	var len uint16
+func ReadBytes(r io.Reader) (data []byte, err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			err = fmt.Errorf("read bytes fail ,err : %s", e)
+		}
+	}()
+	var len uint64
 	err = binary.Read(r, binary.LittleEndian, &len)
 	if err != nil {
 		return
 	}
+	if len == 0 || len > ^uint64(0) {
+		err = fmt.Errorf("data len out of range, %d", len)
+		return
+	}
 	var n int
-	_data := make([]byte, len)
-	n, err = r.Read(_data)
+	data = make([]byte, len)
+	n, err = r.Read(data)
 	if err != nil {
 		return
 	}
@@ -346,9 +395,37 @@ func ReadData(r io.Reader) (data string, err error) {
 		err = fmt.Errorf("error data len")
 		return
 	}
+	return
+}
+func ReadData(r io.Reader) (data string, err error) {
+	_data, err := ReadBytes(r)
+	if err != nil {
+		return
+	}
 	data = string(_data)
 	return
 }
+
+//non typed packet with Bytes
+func ReadPacketBytes(r io.Reader, data ...*[]byte) (err error) {
+	for _, d := range data {
+		*d, err = ReadBytes(r)
+		if err != nil {
+			return
+		}
+	}
+	return
+}
+func BuildPacketBytes(data ...[]byte) []byte {
+	pkg := new(bytes.Buffer)
+	for _, d := range data {
+		binary.Write(pkg, binary.LittleEndian, uint64(len(d)))
+		binary.Write(pkg, binary.LittleEndian, d)
+	}
+	return pkg.Bytes()
+}
+
+//non typed packet with string
 func ReadPacketData(r io.Reader, data ...*string) (err error) {
 	for _, d := range data {
 		*d, err = ReadData(r)
@@ -358,13 +435,50 @@ func ReadPacketData(r io.Reader, data ...*string) (err error) {
 	}
 	return
 }
-func ReadPacket(r io.Reader, typ *uint8, data ...*string) (err error) {
+func BuildPacketData(data ...string) []byte {
+	pkg := new(bytes.Buffer)
+	for _, d := range data {
+		bytes := []byte(d)
+		binary.Write(pkg, binary.LittleEndian, uint64(len(bytes)))
+		binary.Write(pkg, binary.LittleEndian, bytes)
+	}
+	return pkg.Bytes()
+}
+
+//typed packet with bytes
+func ReadBytesPacket(r io.Reader, packetType *uint8, data ...*[]byte) (err error) {
 	var connType uint8
 	err = binary.Read(r, binary.LittleEndian, &connType)
 	if err != nil {
 		return
 	}
-	*typ = connType
+	*packetType = connType
+	for _, d := range data {
+		*d, err = ReadBytes(r)
+		if err != nil {
+			return
+		}
+	}
+	return
+}
+func BuildBytesPacket(packetType uint8, data ...[]byte) []byte {
+	pkg := new(bytes.Buffer)
+	binary.Write(pkg, binary.LittleEndian, packetType)
+	for _, d := range data {
+		binary.Write(pkg, binary.LittleEndian, uint64(len(d)))
+		binary.Write(pkg, binary.LittleEndian, d)
+	}
+	return pkg.Bytes()
+}
+
+//typed packet with string
+func ReadPacket(r io.Reader, packetType *uint8, data ...*string) (err error) {
+	var connType uint8
+	err = binary.Read(r, binary.LittleEndian, &connType)
+	if err != nil {
+		return
+	}
+	*packetType = connType
 	for _, d := range data {
 		*d, err = ReadData(r)
 		if err != nil {
@@ -373,25 +487,18 @@ func ReadPacket(r io.Reader, typ *uint8, data ...*string) (err error) {
 	}
 	return
 }
-func BuildPacket(typ uint8, data ...string) []byte {
+
+func BuildPacket(packetType uint8, data ...string) []byte {
 	pkg := new(bytes.Buffer)
-	binary.Write(pkg, binary.LittleEndian, typ)
+	binary.Write(pkg, binary.LittleEndian, packetType)
 	for _, d := range data {
 		bytes := []byte(d)
-		binary.Write(pkg, binary.LittleEndian, uint16(len(bytes)))
+		binary.Write(pkg, binary.LittleEndian, uint64(len(bytes)))
 		binary.Write(pkg, binary.LittleEndian, bytes)
 	}
 	return pkg.Bytes()
 }
-func BuildPacketData(data ...string) []byte {
-	pkg := new(bytes.Buffer)
-	for _, d := range data {
-		bytes := []byte(d)
-		binary.Write(pkg, binary.LittleEndian, uint16(len(bytes)))
-		binary.Write(pkg, binary.LittleEndian, bytes)
-	}
-	return pkg.Bytes()
-}
+
 func SubStr(str string, start, end int) string {
 	if len(str) == 0 {
 		return ""
@@ -411,12 +518,21 @@ func SubBytes(bytes []byte, start, end int) []byte {
 	return bytes[start:end]
 }
 func TlsBytes(cert, key string) (certBytes, keyBytes []byte, err error) {
-	certBytes, err = ioutil.ReadFile(cert)
+	base64Prefix := "base64://"
+	if strings.HasPrefix(cert, base64Prefix) {
+		certBytes, err = base64.StdEncoding.DecodeString(cert[len(base64Prefix):])
+	} else {
+		certBytes, err = ioutil.ReadFile(cert)
+	}
 	if err != nil {
 		err = fmt.Errorf("err : %s", err)
 		return
 	}
-	keyBytes, err = ioutil.ReadFile(key)
+	if strings.HasPrefix(key, base64Prefix) {
+		keyBytes, err = base64.StdEncoding.DecodeString(key[len(base64Prefix):])
+	} else {
+		keyBytes, err = ioutil.ReadFile(key)
+	}
 	if err != nil {
 		err = fmt.Errorf("err : %s", err)
 		return
@@ -487,7 +603,7 @@ func HttpGet(URL string, timeout int, host ...string) (body []byte, code int, er
 	body, err = ioutil.ReadAll(resp.Body)
 	return
 }
-func IsIternalIP(domainOrIP string, always bool) bool {
+func IsInternalIP(domainOrIP string, always bool) bool {
 	var outIPs []net.IP
 	var err error
 	var isDomain bool
@@ -499,7 +615,7 @@ func IsIternalIP(domainOrIP string, always bool) bool {
 	}
 
 	if isDomain {
-		outIPs, err = MyLookupIP(domainOrIP)
+		outIPs, err = LookupIP(domainOrIP)
 	} else {
 		outIPs = []net.IP{net.ParseIP(domainOrIP)}
 	}
@@ -507,6 +623,7 @@ func IsIternalIP(domainOrIP string, always bool) bool {
 	if err != nil {
 		return false
 	}
+
 	for _, ip := range outIPs {
 		if ip.IsLoopback() {
 			return true
@@ -514,7 +631,7 @@ func IsIternalIP(domainOrIP string, always bool) bool {
 		if ip.To4().Mask(net.IPv4Mask(255, 0, 0, 0)).String() == "10.0.0.0" {
 			return true
 		}
-		if ip.To4().Mask(net.IPv4Mask(255, 0, 0, 0)).String() == "192.168.0.0" {
+		if ip.To4().Mask(net.IPv4Mask(255, 255, 0, 0)).String() == "192.168.0.0" {
 			return true
 		}
 		if ip.To4().Mask(net.IPv4Mask(255, 0, 0, 0)).String() == "172.0.0.0" {
@@ -577,6 +694,63 @@ func RemoveProxyHeaders(head []byte) []byte {
 func InsertProxyHeaders(head []byte, headers string) []byte {
 	return bytes.Replace(head, []byte("\r\n"), []byte("\r\n"+headers), 1)
 }
+func LBMethod(key string) int {
+	typs := map[string]int{"weight": lb.SELECT_WEITHT, "leasttime": lb.SELECT_LEASTTIME, "leastconn": lb.SELECT_LEASTCONN, "hash": lb.SELECT_HASH, "roundrobin": lb.SELECT_ROUNDROBIN}
+	return typs[key]
+}
+func UDPCopy(dst, src *net.UDPConn, dstAddr net.Addr, readTimeout time.Duration, beforeWriteFn func(data []byte) []byte, deferFn func(e interface{})) {
+	go func() {
+		defer func() {
+			deferFn(recover())
+		}()
+		buf := LeakyBuffer.Get()
+		defer LeakyBuffer.Put(buf)
+		for {
+			if readTimeout > 0 {
+				src.SetReadDeadline(time.Now().Add(readTimeout))
+			}
+			n, err := src.Read(buf)
+			if readTimeout > 0 {
+				src.SetReadDeadline(time.Time{})
+			}
+			if err != nil {
+				if IsNetClosedErr(err) || IsNetTimeoutErr(err) || IsNetRefusedErr(err) {
+					return
+				}
+				continue
+			}
+			_, err = dst.WriteTo(beforeWriteFn(buf[:n]), dstAddr)
+			if err != nil {
+				if IsNetClosedErr(err) {
+					return
+				}
+				continue
+			}
+		}
+	}()
+}
+func IsNetClosedErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "use of closed network connection")
+}
+func IsNetTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	e, ok := err.(net.Error)
+	return ok && e.Timeout()
+}
+func IsNetRefusedErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "connection refused")
+}
+func IsNetDeadlineErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "i/o deadline reached")
+}
+func IsNetSocketNotConnectedErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "socket is not connected")
+}
+func NewDefaultLogger() *logger.Logger {
+	return logger.New(os.Stderr, "", logger.LstdFlags)
+}
 
 // type sockaddr struct {
 // 	family uint16
@@ -635,14 +809,14 @@ func InsertProxyHeaders(head []byte, headers string) []byte {
 // 	return
 // }
 
-
 /*
 net.LookupIP may cause  deadlock in windows
 https://github.com/golang/go/issues/24178
 */
-func MyLookupIP(host string) ([]net.IP, error) {
 
-	ctx ,cancel := context.WithTimeout(context.Background(),time.Second *time.Duration(3))
+func LookupIP(host string) ([]net.IP, error) {
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(3))
 	defer func() {
 		cancel()
 		//ctx.Done()
