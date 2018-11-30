@@ -34,6 +34,8 @@ import (
 	"github.com/snail007/goproxy/utils/id"
 
 	kcp "github.com/xtaci/kcp-go"
+
+	"github.com/gorilla/websocket"
 )
 
 func IoBind(dst io.ReadWriteCloser, src io.ReadWriteCloser, fn func(err interface{}), log *logger.Logger) {
@@ -208,6 +210,20 @@ func ConnectKCPHost(hostAndPort string, config kcpcfg.KCPConfigArgs) (conn net.C
 		return kcpconn, err
 	}
 	return NewCompStream(kcpconn), err
+}
+
+type WsConn struct {
+	net.Conn
+}
+func (c *WsConn)SetDeadline(t time.Time) error{
+	return nil
+}
+func ConnectWSHost()(conn net.Conn, err error){
+	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		return
+	}
+	return WsConn(c), err
 }
 
 func PathExists(_path string) bool {

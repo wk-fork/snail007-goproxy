@@ -19,6 +19,8 @@ import (
 	"github.com/snail007/goproxy/core/lib/kcpcfg"
 
 	kcp "github.com/xtaci/kcp-go"
+	"net/http"
+	"github.com/gorilla/websocket"
 )
 
 func init() {
@@ -306,6 +308,35 @@ func (s *ServerChannel) ListenTOU(method, password string, compress bool, fn fun
 		}
 	}()
 
+	return
+}
+func (s *ServerChannel) ListenWS(fn func(conn net.Conn)) (err error){
+	var upgrader = websocket.Upgrader{}
+	f := func (w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			s.log.Print("upgrade:", err)
+			return
+		}
+		fn(conn)
+	}
+	home := func (w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "hello world")
+	}
+	http.HandleFunc("/ws", f)
+	http.HandleFunc("/", home)
+
+	addr := net.JoinHostPort(s.ip, fmt.Sprintf("%d", s.port))
+	server := &http.Server{Addr: addr, Handler: nil}
+	if addr == "" {
+		addr = ":http"
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	s.Listener = &ln
+	server.Serve(ln.(*net.TCPListener))
 	return
 }
 func (s *ServerChannel) Close() {
