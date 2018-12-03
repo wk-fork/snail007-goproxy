@@ -21,6 +21,7 @@ import (
 	kcp "github.com/xtaci/kcp-go"
 	"net/http"
 	"github.com/gorilla/websocket"
+	ws "github.com/snail007/goproxy/core/lib/websocket"
 )
 
 func init() {
@@ -318,7 +319,7 @@ func (s *ServerChannel) ListenWS(fn func(conn net.Conn)) (err error){
 			s.log.Print("upgrade:", err)
 			return
 		}
-		fn(conn)
+		fn(ws.New(conn))
 	}
 	home := func (w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "hello world")

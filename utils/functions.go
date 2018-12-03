@@ -36,6 +36,7 @@ import (
 	kcp "github.com/xtaci/kcp-go"
 
 	"github.com/gorilla/websocket"
+	ws "github.com/snail007/goproxy/core/lib/websocket"
 )
 
 func IoBind(dst io.ReadWriteCloser, src io.ReadWriteCloser, fn func(err interface{}), log *logger.Logger) {
@@ -223,7 +224,7 @@ func ConnectWSHost()(conn net.Conn, err error){
 	if err != nil {
 		return
 	}
-	return WsConn(c), err
+	return ws.New(c), err
 }
 
 func PathExists(_path string) bool {
