@@ -37,6 +37,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	ws "github.com/snail007/goproxy/core/lib/websocket"
+	url2 "net/url"
 )
 
 func IoBind(dst io.ReadWriteCloser, src io.ReadWriteCloser, fn func(err interface{}), log *logger.Logger) {
@@ -219,7 +220,8 @@ type WsConn struct {
 func (c *WsConn)SetDeadline(t time.Time) error{
 	return nil
 }
-func ConnectWSHost()(conn net.Conn, err error){
+func ConnectWSHost(url string)(conn net.Conn, err error){
+	u,err := url2.Parse(url)
 	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
 		return
